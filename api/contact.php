@@ -21,11 +21,29 @@ function env_load(string $file): void {
     [$k, $v] = explode('=', $line, 2);
     $k = trim($k);
     $v = trim($v, " \t\"'");
+    // Gmail App Passwords are often pasted with spaces (abcd efgh ...); SMTP needs no whitespace.
+    if ($k === 'SMTP_PASS') {
+      $v = preg_replace('/\s+/u', '', $v) ?? $v;
+    }
     if ($k !== '' && getenv($k) === false) {
       putenv("$k=$v");
       $_ENV[$k] = $v;
     }
   }
+}
+
+/** Private mail diagnostic log under data/ (web-denied). Never write secrets. */
+function mail_log(string $root, string $stage, string $detail = ''): void {
+  $dir = $root . '/data';
+  if (!is_dir($dir) && !mkdir($dir, 0700, true) && !is_dir($dir)) return;
+  $line = gmdate('c') . "\t" . $stage;
+  if ($detail !== '') {
+    $safe = preg_replace('/[\x00-\x1F\x7F]+/', ' ', $detail) ?? $detail;
+    // Redact anything that looks like a base64 AUTH payload or password-ish token.
+    $safe = preg_replace('/\b[A-Za-z0-9+\/=]{20,}\b/', '[redacted]', $safe) ?? $safe;
+    $line .= "\t" . substr($safe, 0, 240);
+  }
+  @file_put_contents($dir . '/mail.log', $line . "\n", FILE_APPEND | LOCK_EX);
 }
 
 function client_ip(): string {
@@ -59,15 +77,26 @@ function send_mail_simple(string $to, string $from, string $subject, string $bod
   return @mail($to, '=?UTF-8?B?' . base64_encode($subject) . '?=', $body, implode("\r\n", $headers));
 }
 
-function send_mail_smtp(string $host, int $port, string $user, string $pass, string $to, string $from, string $subject, string $body, string $replyTo = ''): bool {
+function send_mail_smtp(string $root, string $host, int $port, string $user, string $pass, string $to, string $from, string $subject, string $body, string $replyTo = ''): bool {
+  // Defensive: strip whitespace even if SMTP_PASS came from the process environment.
+  $pass = preg_replace('/\s+/u', '', $pass) ?? $pass;
   $remote = ($port === 465 ? 'ssl://' : 'tcp://') . $host . ':' . $port;
   $fp = @stream_socket_client($remote, $errno, $errstr, 12, STREAM_CLIENT_CONNECT);
-  if (!$fp) return false;
+  if (!$fp) {
+    mail_log($root, 'connect', "fail errno=$errno err=" . substr($errstr, 0, 120) . " remote=$host:$port");
+    return false;
+  }
   stream_set_timeout($fp, 12);
   $read = function () use ($fp) { return (string)fgets($fp, 512); };
   $cmd = function (string $line) use ($fp) { fwrite($fp, $line . "\r\n"); };
-  $read();
-  $cmd('EHLO ravichandra.site');
+  $banner = $read();
+  if ($banner === '' || !str_starts_with($banner, '220')) {
+    mail_log($root, 'banner', trim($banner) !== '' ? trim($banner) : 'empty');
+    fclose($fp);
+    return false;
+  }
+  $ehloHost = preg_replace('/[^a-zA-Z0-9.-]/', '', (string)(parse_url((string)(getenv('SITE_URL') ?: ''), PHP_URL_HOST) ?: 'localhost')) ?: 'localhost';
+  $cmd('EHLO ' . $ehloHost);
   $ehlo = '';
   while ($line = $read()) {
     $ehlo .= $line;
@@ -75,25 +104,64 @@ function send_mail_smtp(string $host, int $port, string $user, string $pass, str
   }
   if ($port !== 465 && stripos($ehlo, 'STARTTLS') !== false) {
     $cmd('STARTTLS');
-    $read();
+    $tlsResp = $read();
+    if (!str_starts_with($tlsResp, '220')) {
+      mail_log($root, 'starttls', trim($tlsResp));
+      fclose($fp);
+      return false;
+    }
     $ok = @stream_socket_enable_crypto($fp, true, STREAM_CRYPTO_METHOD_TLS_CLIENT);
-    if (!$ok) { fclose($fp); return false; }
-    $cmd('EHLO ravichandra.site');
+    if (!$ok) {
+      mail_log($root, 'tls', 'stream_socket_enable_crypto failed');
+      fclose($fp);
+      return false;
+    }
+    $cmd('EHLO ' . $ehloHost);
     while ($line = $read()) { if (strlen($line) < 4 || $line[3] !== '-') break; }
   }
   $cmd('AUTH LOGIN');
-  $read();
+  $authPrompt = $read();
+  if (!str_starts_with($authPrompt, '334')) {
+    mail_log($root, 'auth-start', trim($authPrompt));
+    fclose($fp);
+    return false;
+  }
   $cmd(base64_encode($user));
-  $read();
+  $userPrompt = $read();
+  if (!str_starts_with($userPrompt, '334')) {
+    mail_log($root, 'auth-user', trim($userPrompt));
+    fclose($fp);
+    return false;
+  }
   $cmd(base64_encode($pass));
   $auth = $read();
-  if (!str_starts_with($auth, '235')) { fclose($fp); return false; }
+  if (!str_starts_with($auth, '235')) {
+    // Log SMTP reply code/text only — never user/pass.
+    mail_log($root, 'auth', trim($auth) . ' user_len=' . strlen($user) . ' pass_len=' . strlen($pass));
+    fclose($fp);
+    return false;
+  }
   $cmd('MAIL FROM:<' . $from . '>');
-  $read();
+  $mailFrom = $read();
+  if (!str_starts_with($mailFrom, '250')) {
+    mail_log($root, 'mail-from', trim($mailFrom));
+    fclose($fp);
+    return false;
+  }
   $cmd('RCPT TO:<' . $to . '>');
-  $read();
+  $rcpt = $read();
+  if (!str_starts_with($rcpt, '250')) {
+    mail_log($root, 'rcpt', trim($rcpt));
+    fclose($fp);
+    return false;
+  }
   $cmd('DATA');
-  $read();
+  $data = $read();
+  if (!str_starts_with($data, '354')) {
+    mail_log($root, 'data', trim($data));
+    fclose($fp);
+    return false;
+  }
   $reply = filter_var($replyTo, FILTER_VALIDATE_EMAIL) ? $replyTo : $from;
   $payload = 'From: ' . $from . "\r\n" .
     'To: ' . $to . "\r\n" .
@@ -101,7 +169,9 @@ function send_mail_smtp(string $host, int $port, string $user, string $pass, str
     'Subject: =?UTF-8?B?' . base64_encode($subject) . '?=' . "\r\n" .
     "MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" . $body . "\r\n.";
   $cmd($payload);
-  $ok = str_starts_with($read(), '250');
+  $final = $read();
+  $ok = str_starts_with($final, '250');
+  if (!$ok) mail_log($root, 'send', trim($final));
   $cmd('QUIT');
   fclose($fp);
   return $ok;
@@ -192,20 +262,28 @@ $record = json_encode([
 
 $sent = false;
 $smtpHost = getenv('SMTP_HOST') ?: '';
-if ($smtpHost && getenv('SMTP_USER') && getenv('SMTP_PASS')) {
+$smtpPass = preg_replace('/\s+/u', '', (string)(getenv('SMTP_PASS') ?: '')) ?? '';
+if ($smtpHost && $smtpUser !== '' && $smtpPass !== '') {
   $sent = send_mail_smtp(
+    $root,
     $smtpHost,
     (int)(getenv('SMTP_PORT') ?: 587),
     $smtpUser,
-    (string)getenv('SMTP_PASS'),
+    $smtpPass,
     $to,
     $fromDefault,
     $subject,
     $body,
     $email
   );
+  if (!$sent) mail_log($root, 'smtp-failed', 'falling back to mail()');
+} else {
+  mail_log($root, 'smtp-skip', 'missing SMTP_HOST/USER/PASS');
 }
 if (!$sent) $sent = send_mail_simple($to, $fromDefault, $subject, $body);
-if (!$sent) out(500, ['error' => 'Saved locally, but email could not be sent. Check SMTP on the server.']);
+if (!$sent) {
+  mail_log($root, 'mail-failed', 'SMTP and mail() both failed');
+  out(500, ['error' => 'Saved locally, but email could not be sent. Check SMTP on the server.']);
+}
 
 out(200, ['ok' => true]);
