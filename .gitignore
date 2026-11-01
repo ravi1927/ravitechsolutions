@@ -1,0 +1,6 @@
+.env
+data/inbox.jsonl
+data/rate/
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Disallow: /stats.html
+Disallow: /api/
+Disallow: /data/
+Sitemap: https://ravitechsolutions.com/sitemap.xml

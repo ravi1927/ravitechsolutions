@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Site visitors — private</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="nav">
+      <a class="brand" href="index.html"><img src="assets/rts-logo.jpg" width="36" height="36" alt="" />Ravi Tech Solutions</a>
+      <a class="btn ghost" href="index.html">Back to site</a>
+    </header>
+    <p class="kicker">Private</p>
+    <h1>Visitors</h1>
+    <p class="meta" id="hint">Add <code>?key=your-STATS_KEY</code> to this URL (same value as in <code>.env</code>).</p>
+    <div class="stat-row">
+      <div class="stat"><span class="kicker">Today</span><b id="today">—</b><span class="meta" id="todayViews"></span></div>
+      <div class="stat"><span class="kicker">All time</span><b id="total">—</b><span class="meta" id="totalViews"></span></div>
+    </div>
+    <table class="days">
+      <thead><tr><th>Date (UTC)</th><th>Visitors</th><th>Page views</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <script>
+    const key = new URLSearchParams(location.search).get('key') || '';
+    fetch('api/visit.php?report=1&key=' + encodeURIComponent(key), { credentials: 'same-origin' })
+      .then((r) => r.json())
+      .then((d) => {
+        if (!d.ok) return;
+        document.getElementById('today').textContent = d.today;
+        document.getElementById('total').textContent = d.total;
+        document.getElementById('todayViews').textContent = d.todayViews + ' page views today';
+        document.getElementById('totalViews').textContent = d.totalViews + ' page views total';
+        const tb = document.getElementById('rows');
+        (d.days || []).forEach((row) => {
+          tb.insertAdjacentHTML('beforeend', `<tr><td>${row.date}</td><td>${row.visitors}</td><td>${row.views}</td></tr>`);
+        });
+        if (d.days) document.getElementById('hint').textContent = 'Unique visitors (one count per person per day). Bots are ignored.';
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>
